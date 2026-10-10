@@ -1,0 +1,10 @@
+# Datos del desafío: no se suben (pesados y médicos)
+DATASET/
+imagenes/
+*.nii
+*.nii.gz
+*.xlsx
+*.crdownload
+resultados/
+__pycache__/
+*.html
