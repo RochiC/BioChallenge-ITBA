@@ -23,12 +23,15 @@ from scipy import ndimage
 from scipy.spatial import ConvexHull, QhullError
 from skimage import measure, filters
 
+import atlas
+
 # >>> CAMBIEN ESTO si mueven la carpeta: donde están dataset.xlsx y la carpeta imagenes/
 BASE = Path(r"C:\Users\Asus\Downloads\DATASET")
 SALIDA = BASE / "resultados"
 PACIENTE = "040183"   # con el 0 adelante, como texto
 N_ESTUDIO = 1         # qué control mostrar en 3D (1 = el primero)
 
+BORDE_MM = 0.5        # incertidumbre del borde de la segmentación: ±0,5 mm (en mm reales, igual en x, y, z)
 UNION_MM = 5.0        # una mancha a menos de 5 mm de donde hubo una lesión es esa misma lesión
                       # (con 5 mm la cantidad de lesiones coincide con la historia clínica en los 10 pacientes)
 pd.set_option("display.width", 220)
@@ -119,7 +122,16 @@ def referencia_cabeza(t1, affine, zooms, resolucion_mm=3.0):
         cabeza = etiquetas == (np.argmax(tamanios) + 1)
     cabeza = ndimage.binary_fill_holes(cabeza)
     pts = a_mm(np.argwhere(cabeza) * paso, affine)
-    return dict(centro=pts.mean(axis=0), minimo=pts.min(axis=0), maximo=pts.max(axis=0), mascara=cabeza, paso=paso)
+    # cerebro aproximado: se le quita a la cabeza una capa de ~9 mm (cuero cabelludo y cráneo)
+    capa = max(1, int(round(9 / float(np.mean(paso * zooms)))))
+    cerebro = ndimage.binary_erosion(cabeza, iterations=capa)
+    et, n = ndimage.label(cerebro)
+    if n > 1:
+        cerebro = et == (np.argmax(ndimage.sum(cerebro, et, range(1, n + 1))) + 1)
+    cerebro = ndimage.binary_fill_holes(ndimage.binary_dilation(cerebro, iterations=max(1, capa // 3))) if n else cabeza
+    pc = a_mm(np.argwhere(cerebro) * paso, affine)
+    return dict(centro=pts.mean(axis=0), minimo=pts.min(axis=0), maximo=pts.max(axis=0), mascara=cabeza, paso=paso,
+                cerebro=cerebro, caja_cerebro=dict(minimo=pc.min(axis=0), maximo=pc.max(axis=0)))
 
 
 def ubicar(c_mm, ref, margen_mm=8):
@@ -189,7 +201,7 @@ def clase_diametro(d, basal, nadir):
 
 
 # %% 3. Motor: procesar un paciente completo
-def identificar_lesiones(mascaras, zooms):
+def identificar_lesiones(mascaras, zooms, fusiones=None):
     """Da a cada lesión un número (L1, L2, ...) que se mantiene en todos los controles.
     Como las RM están corregistradas, una lesión ocupa el mismo lugar en todos los estudios.
     Control por control, cada mancha 3D:
@@ -216,13 +228,19 @@ def identificar_lesiones(mascaras, zooms):
                 ids[sel] = candidatas[0]
             else:
                 ids[sel] = cercana[sel]
+                if fusiones is not None:
+                    fusiones.append((len(ids_por_control), sorted(int(c) for c in candidatas)))
         historia[ids > 0] = ids[ids > 0]
         ids_por_control.append(ids)
     return ids_por_control, n
 
 
-def procesar_paciente(pid, verbose=True):
-    est = estudios[estudios.paciente_id == pid].sort_values("n_estudio").reset_index(drop=True)
+def procesar_paciente(pid, verbose=True, est=None):
+    """est: tabla de estudios (por defecto, la del Excel). Para estudios cargados por el médico se pasa
+    una tabla propia con archivo_imagen / archivo_mascara como rutas absolutas y spacing_* vacíos."""
+    if est is None:
+        est = estudios[estudios.paciente_id == pid]
+    est = est.sort_values("n_estudio").reset_index(drop=True)
     avisos = []
 
     # Paso 0: cargar, verificar tamaño de vóxel y recortar a la zona con lesiones
@@ -233,8 +251,10 @@ def procesar_paciente(pid, verbose=True):
         excel = np.array([f.spacing_x_mm, f.spacing_y_mm, f.spacing_z_mm])
         if np.abs(z - excel).max() > 0.01:
             avisos.append(f"control {f.n_estudio}: vóxel del NIfTI {np.round(z, 4)} ≠ Excel {excel}")
-        if zooms is not None and (np.abs(z - zooms).max() > 1e-3 or seg.shape != mascaras[0].shape):
-            avisos.append(f"control {f.n_estudio}: grilla distinta al control 1")
+        if zooms is not None and (np.abs(z - zooms).max() > 1e-3 or seg.shape != mascaras[0].shape
+                                  or not np.allclose(seg.affine, affine, atol=1e-3)):
+            avisos.append(f"control {f.n_estudio}: grilla o posición (afín) distinta al control 1: "
+                          "la comparación por posición no es válida")
         zooms = z if zooms is None else zooms
         affine = seg.affine if affine is None else affine
         m = np.rint(seg.get_fdata()).astype(np.uint8)
@@ -260,7 +280,11 @@ def procesar_paciente(pid, verbose=True):
     mascaras = [m[caja] for m in mascaras]
 
     # Pasos 1 y 2: separar las lesiones y seguirlas en el tiempo
-    ids, n_les = identificar_lesiones(mascaras, zooms)
+    fusiones = []
+    ids, n_les = identificar_lesiones(mascaras, zooms, fusiones)
+    for k, cuales in fusiones:
+        avisos.append(f"control {est.n_estudio[k]}: las lesiones {', '.join(f'L{c}' for c in cuales)} se tocan "
+                      "(se separaron por cercanía; revisar)")
 
     # Pasos 3 a 5: medir cada lesión en cada control
     filas = []
@@ -278,35 +302,39 @@ def procesar_paciente(pid, verbose=True):
             sub = ndimage.find_objects(comp.astype(np.uint8))[0]
             sub = tuple(slice(max(s.start - 1, 0), min(s.stop + 1, N)) for s, N in zip(sub, comp.shape))
             c, et = comp[sub], m[sub]
-            borde_in = n - ndimage.binary_erosion(c, VEC6).sum()
-            borde_out = ndimage.binary_dilation(np.pad(c, 1), VEC6).sum() - n
             d = diametro_rano(c, zooms)
+            d_realce = diametro_rano(c & (et == 1), zooms) if (c & (et == 1)).any() else dict(d=0.0)
             d3, area = forma_3d(c, zooms)
             o = offset + np.array([s.start for s in sub])
             centro_vox = np.argwhere(c).mean(axis=0) + o
             centro = a_mm(centro_vox, affine)
-            lado, region = ubicar(centro, ref)
+            lado, region, _, mni = atlas.region_de(centro, ref["caja_cerebro"])
             v = n * vv_cm3
+            # incertidumbre: correr el borde BORDE_MM hacia adentro / afuera cambia el volumen en superficie × BORDE_MM
+            # (la superficie está en mm², así que vale igual con vóxeles anisótropos)
+            dv = area * BORDE_MM / 1000
             fila.update(
                 total_cm3=v,
                 realce_cm3=(c & (et == 1)).sum() * vv_cm3,
                 necrosis_cm3=(c & (et == 2)).sum() * vv_cm3,
-                vol_min_cm3=(n - 0.5 * borde_in) * vv_cm3,   # ± media capa de vóxeles de borde
-                vol_max_cm3=(n + 0.5 * borde_out) * vv_cm3,
-                diam_rano_mm=d["d"], diam_perp_mm=d["perp"], diam_3d_mm=d3,
+                vol_min_cm3=max(v - dv, 0.0), vol_max_cm3=v + dv,
+                volumen_confiable=bool(v - dv > 0),  # si al correr el borde no queda volumen, el dato no es confiable
+                diam_rano_mm=d["d"], diam_perp_mm=d["perp"], diam_3d_mm=d3, diam_realce_mm=d_realce["d"],
                 cortes_axiales=d["cortes"], corte_rano=int(d["z"] + o[2]),
                 medible_rano=bool(d["d"] >= 10 and d["perp"] >= 5 and d["cortes"] >= 2 and d["d"] >= 2 * zooms[2]),
                 esfericidad=float(np.pi ** (1 / 3) * (6 * v * 1000) ** (2 / 3) / area),
                 vol_esfera_diam_cm3=np.pi * d["d"] ** 3 / 6 / 1000,
                 centro_x_mm=centro[0], centro_y_mm=centro[1], centro_z_mm=centro[2],
                 corte_axial_centro=int(round(centro_vox[2])),
-                hemisferio=lado, region_aprox=region,
+                hemisferio=lado, region_aprox=region, mni_x=mni[0], mni_y=mni[1], mni_z=mni[2],
                 # extremos del diámetro RANO en mm (para dibujar la línea en el 3D)
                 rano_p1=tuple(np.round(a_mm(np.r_[d["p1"] + o[:2], d["z"] + o[2]], affine), 2)),
                 rano_p2=tuple(np.round(a_mm(np.r_[d["p2"] + o[:2], d["z"] + o[2]], affine), 2)),
             )
             fila["necrosis_pct"] = 100 * fila["necrosis_cm3"] / v
             fila["error_diam_vs_vol_pct"] = 100 * (fila["vol_esfera_diam_cm3"] - v) / v
+            # índice de esfericidad: volumen real / volumen de la esfera con ese diámetro (1 = esfera perfecta)
+            fila["indice_esfericidad"] = v / fila["vol_esfera_diam_cm3"] if fila["vol_esfera_diam_cm3"] else np.nan
             # Paso 7: mapa de cambio contra el control anterior
             if k > 0:
                 antes = ids[k - 1] == L
@@ -348,9 +376,10 @@ def procesar_paciente(pid, verbose=True):
             tabla.loc[idx, "clase_volumen_huang"] = clase_huang(v, vb, vn) if vn else cv
             tabla.loc[idx, "clase_diametro"] = cd = clase_diametro(r.diam_rano_mm, b.diam_rano_mm, prev.diam_rano_mm.min())
             tabla.loc[idx, "desacuerdo"] = cv != cd
-            # ¿el cambio supera el margen de error de la medición?
-            tabla.loc[idx, "cambio_concluyente"] = bool(
-                r.vol_min_cm3 > ant.vol_max_cm3 or r.vol_max_cm3 < ant.vol_min_cm3)
+            # ¿la clasificación depende del margen de error? se clasifica con el volumen mínimo y con el máximo
+            c_min, c_max = clase_volumen(r.vol_min_cm3, vb, vn), clase_volumen(r.vol_max_cm3, vb, vn)
+            tabla.loc[idx, "cambio_concluyente"] = bool(c_min == c_max)
+            tabla.loc[idx, "clase_volumen_rango"] = c_min if c_min == c_max else f"{c_min} / {c_max}"
             # estimación: velocidad de crecimiento y tiempo de duplicación (o de reducción a la mitad)
             dt = r.dia - ant.dia
             if v > 0 and ant.total_cm3 > 0 and dt > 0:
@@ -450,26 +479,31 @@ def validar():
                       f"{ed.mean():+5.2f} mm (peor {ed[np.argmax(abs(ed))]:+5.2f} mm)")
 
 
-validar()
+if __name__ == "__main__":
+    validar()
 
 
 # %% 5. Procesar TODOS los pacientes y guardar las tablas
-SALIDA.mkdir(exist_ok=True)
-resultados = {}
-for pid in pacientes.paciente_id:
-    resultados[pid] = procesar_paciente(pid)
+def procesar_todos():
+    SALIDA.mkdir(exist_ok=True)
+    res = {pid: procesar_paciente(pid) for pid in pacientes.paciente_id}
+    les = pd.concat([r["tabla"] for r in res.values()], ignore_index=True)
+    ran = pd.concat([r["rano"] for r in res.values()], ignore_index=True)
+    les.to_csv(SALIDA / "lesiones_por_control.csv", index=False, encoding="utf-8-sig")
+    ran.to_csv(SALIDA / "rano_por_paciente.csv", index=False, encoding="utf-8-sig")
+    print(f"\nGuardado en {SALIDA}")
+    return res, les, ran
 
-lesiones_df = pd.concat([r["tabla"] for r in resultados.values()], ignore_index=True)
-rano_df = pd.concat([r["rano"] for r in resultados.values()], ignore_index=True)
-lesiones_df.to_csv(SALIDA / "lesiones_por_control.csv", index=False, encoding="utf-8-sig")
-rano_df.to_csv(SALIDA / "rano_por_paciente.csv", index=False, encoding="utf-8-sig")
-print(f"\nGuardado en {SALIDA}")
 
-cols = ["paciente_id", "n_estudio", "dia", "lesion", "total_cm3", "necrosis_pct", "diam_rano_mm", "diam_3d_mm",
-        "hemisferio", "region_aprox", "estado", "clase_diametro", "desacuerdo", "cambio_concluyente"]
-print(lesiones_df[lesiones_df.total_cm3 > 0][cols].round(2).to_string(index=False))
-print(rano_df[["paciente_id", "n_estudio", "dia", "suma_diam_mm", "suma_vol_cm3", "rano_bm", "volumetrico",
-               "desacuerdo"]].round(2).to_string(index=False))
+# Las celdas 5 a 7 solo corren al ejecutar este archivo (o en VS Code);
+# al importarlo desde exportar_dashboard.py se usan solo las funciones.
+if __name__ == "__main__":
+    resultados, lesiones_df, rano_df = procesar_todos()
+    cols = ["paciente_id", "n_estudio", "dia", "lesion", "total_cm3", "necrosis_pct", "diam_rano_mm", "diam_3d_mm",
+            "hemisferio", "region_aprox", "estado", "clase_diametro", "desacuerdo", "cambio_concluyente"]
+    print(lesiones_df[lesiones_df.total_cm3 > 0][cols].round(2).to_string(index=False))
+    print(rano_df[["paciente_id", "n_estudio", "dia", "suma_diam_mm", "suma_vol_cm3", "rano_bm", "volumetrico",
+                   "desacuerdo"]].round(2).to_string(index=False))
 
 
 # %% 6. Vista 3D de un control (lesiones con su número, realce/necrosis y la línea del diámetro RANO)
@@ -526,7 +560,8 @@ def vista_3d(pid, n_estudio):
     return fig
 
 
-vista_3d(PACIENTE, N_ESTUDIO).show()
+if __name__ == "__main__":
+    vista_3d(PACIENTE, N_ESTUDIO).show()
 
 
 # %% 7. Evolución del volumen por lesión con los tratamientos
@@ -543,4 +578,5 @@ def grafico_evolucion(pid):
     return fig
 
 
-grafico_evolucion(PACIENTE).show()
+if __name__ == "__main__":
+    grafico_evolucion(PACIENTE).show()

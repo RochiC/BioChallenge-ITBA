@@ -1,4 +1,4 @@
-# BioChallenge ITBA: seguimiento de metástasis cerebrales
+# Graph3D: seguimiento de metástasis cerebrales (BioChallenge ITBA)
 
 Herramienta para planificar el tratamiento de metástasis cerebrales a partir de las resonancias de seguimiento segmentadas.
 

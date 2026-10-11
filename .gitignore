@@ -7,4 +7,5 @@ imagenes/
 *.crdownload
 resultados/
 __pycache__/
-*.html
+dashboard/data/
+historial/
